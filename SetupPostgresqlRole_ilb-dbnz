@@ -1,0 +1,124 @@
+#!/bin/bash
+set -u
+
+# This script runs before PostgreSQL starts up
+# The objective is to make sure that if we are
+# recoverting from a switchover, we don't starup
+# as the master. We check to see if the switchover
+# was successful, if so, we prepare this instance
+# in recovery/slave mode and connect it to the 
+# current/new master.
+
+# A simple logging function
+LOGFILE=/var/log/$(basename $0).log
+log() {
+	echo "$(date) :: $1" >> $LOGFILE
+	# debugging
+	echo "$(date) :: $1"
+}
+
+#check_pgsql_node IP/HOST PORT TIMEOUT
+check_pgsql_node_is_master () {
+	su - postgres -c "timeout $3 psql -h $1 -p $2 -U monuser -d postgres -t -c 'select pg_is_in_recovery()'" | grep -q -s -w 'f'
+	return $?
+}
+
+# The name of the script tells it which ILB to watch
+# Which also tells us which postgresql port to watch
+# For example:
+# If we are ilb-dbam
+# We will find the port from the loadbalancer
+# Which will be 5432; So we will monitor only that
+BN=$(basename $0)
+MY_ILB=$(echo $BN | cut -d'_' -f2)
+MY_DB=$(echo $MY_ILB | cut -d'-' -f2)
+if [ -z "$MY_DB" ]
+then
+	log "Cannot determine my database. Aborting."
+	exit 1
+fi
+PGTRIGGER="/opt/pgsql/$MY_DB/trigger"
+PGPORT=$(aws elb describe-load-balancers --load-balancer-names $MY_ILB | jq -r '.LoadBalancerDescriptions[].ListenerDescriptions[].Listener.InstancePort')
+
+# First we will check if this db instance
+# is already in recovery/slave mode,
+# if so, we do nothing and let it startup
+if [ -e "/opt/pgsql/$MY_DB/data/recovery.conf" ]
+then
+	log "This already seems to be a slave node. Good to go."
+	exit 0
+else
+	# We are not in recovery mode, which means
+	# we were master before and probably our slave has taken over
+	# let us check if our ilb has been registered with the new master
+	# if so, we will check the new master and connect to it as slave.
+
+	# Find out my own instance id,
+	# on which I am running
+	MY_INSTANCEID=$(wget -q -O - http://instance-data/latest/meta-data/instance-id)
+
+	# Now we find the instance attached to the ILB
+	ILB_INST=$(aws elb describe-load-balancers --load-balancer-names $MY_ILB | jq -r '.LoadBalancerDescriptions[].Instances[].InstanceId')
+
+	# Now we determine if we are in the ILB or is it the other node
+	if [ -n "$ILB_INST" -a "$ILB_INST" == "$MY_INSTANCEID" ]
+	then
+		# If we are in the ILB, we are the master,
+		# we do nothing and let the instance start as master
+		log "I am the master instance for $MY_ILB; Good to go."
+		exit 0
+	elif [ -n "$ILB_INST" -a "$ILB_INST" != "$MY_INSTANCEID" ]
+	then
+		# If we are not in the ILB, who ever is, should be the master
+		# we check the status of the new master node,
+	
+		# First we find out the IP of the master instance
+		MASTER_INST_IP=$(aws ec2 describe-instances --instance-ids $ILB_INST | jq -r '.Reservations[].Instances[].NetworkInterfaces[].PrivateIpAddresses[].PrivateIpAddress')
+	
+		# We check the status on the master node
+		check_pgsql_node_is_master $MASTER_INST_IP $PGPORT 15
+		RET_CODE="$?"
+		
+		if [ "$RET_CODE" == "0" ]
+		then
+			# Our new master seems to be good, let us connect to it as slave
+			log "New master ($ILB_INST/$MASTER_INST_IP/$PGPORT) seems to be good. Initiating slavery!"
+
+			# Remove old data
+			# This step is dangerous
+			# If there is sufficient disk space,
+			# change this step to mv instead of rm
+			log "Removing old data: /opt/pgsql/$MY_DB/data and /opt/pgsql/$MY_DB/archive"
+			rm -rf /opt/pgsql/$MY_DB/data
+			rm -rf /opt/pgsql/$MY_DB/archive
+			su - postgres -c 'mkdir -p /opt/pgsql/$MY_DB/archive/'
+
+			# Take a new pg_basebackup
+			log "Running pg_basebackup from $ILB_INST/$MASTER_INST_IP/$PGPORT"
+			su - postgres -c 'pg_basebackup -h $MASTER_INST_IP -p $PGPORT -D /opt/pgsql/$MY_DB/data -U postgres -v -P --xlog-method=stream' &>> $LOGFILE
+
+			# Creating new revoery.conf
+			log "Creating new recovery.conf"
+			echo "standby_mode = 'on'" > /opt/pgsql/$MY_DB/data/recovery.conf
+			echo "primary_conninfo = 'host=$MASTER_INST_IP port=$PGPORT'" >> /opt/pgsql/$MY_DB/data/recovery.conf
+			echo "trigger_file = '/opt/pgsql/$MY_DB/trigger'" >> /opt/pgsql/$MY_DB/data/recovery.conf
+
+			# Removing any old trigger file
+			rm -rf /opt/pgsql/$MY_DB/trigger
+
+			exit 0
+		else
+			# Our new master seems to be unhealthy!
+			# At this point we need a manual intervention from an administrator
+			# *SEND EMAIL NOTIFICATION*
+			log "Exception, the new master who took over doesn't seem to be working. Don't know what to do. Aborting startup"
+			exit 1
+		fi
+	else
+		# There is no instance in our ILB
+		# We will register our self in the ILB and startup as master
+		log "Ther was no instance in our ILB, registring, and continuing as master"
+		aws elb register-instances-with-load-balancer --load-balancer-name $MY_ILB --instances $MY_IID | tr '\n' ' ' &>> $LOGFILE
+		exit 0
+	fi
+fi

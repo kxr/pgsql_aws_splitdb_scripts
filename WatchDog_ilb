@@ -1,0 +1,125 @@
+#!/bin/bash
+set -u
+
+# Making sure that the script doesn't overlap
+PIDFILE="/var/run/$(basename $0).pid"
+if [ -e $PIDFILE ]
+then
+	log "Another instance of this script is running (PID:$(cat PIDFILE)). Exiting"
+	exit 1
+else
+	echo "$$" > $PIDFILE
+fi
+trap "rm -f -- '$PIDFILE'" EXIT
+
+# A simple logging function
+LOGFILE="/var/log/$(basename $0).log"
+log() {
+	echo "$(date) :: $1" >> $LOGFILE
+	# debugging
+	echo "$(date) :: $1"
+}
+
+#check_pgsql_node IP/HOST PORT TIMEOUT
+check_pgsql_node () {
+	su - postgres -c "timeout $3 psql -h $1 -p $2 -U monuser -d postgres -c 'select version()'" &> /dev/null
+	return $?
+}
+
+# The name of the script tells it which ILB to watch
+# Which also tells us which postgresql port to watch
+# For example:
+# If we are ilb-dbam
+# We will find the port from the loadbalancer
+# Which will be 5432; So we will monitor only that
+BN=$(basename $0)
+MY_ILB=$(echo $BN | cut -d'_' -f2)
+MY_DB=$(echo $MY_ILB | cut -d'-' -f2)
+if [ -z "$MY_DB" ]
+then
+	log "Cannot determine my database. Aborting."
+	exit 1
+fi
+PGTRIGGER="/opt/pgsql/$MY_DB/trigger"
+PGPORT=$(aws elb describe-load-balancers --load-balancer-names $MY_ILB | jq -r '.LoadBalancerDescriptions[].ListenerDescriptions[].Listener.InstancePort')
+
+# Find out my own instance id,
+# on which I am running
+MY_INSTANCEID=$(wget -q -O - http://instance-data/latest/meta-data/instance-id)
+
+# Now we find the instance attached to the ILB
+ILB_INST=$(aws elb describe-load-balancers --load-balancer-names $MY_ILB | jq -r '.LoadBalancerDescriptions[].Instances[].InstanceId')
+
+# Now we determine if we are in the ILB or is it the other node
+if [ -n "$ILB_INST" -a "$ILB_INST" == "$MY_INSTANCEID" ]
+then
+	# If we are in the ILB, we are the master,
+	# we do nothing, we should be checked by the other node
+	log "I am the master instance for $MY_ILB; Exiting"
+	exit 0
+elif [ -n "$ILB_INST" -a "$ILB_INST" != "$MY_INSTANCEID" ]
+then
+	# If we are not in the ILB, we are the slave,
+	# we check the status of the master node,
+	# if the master is down/un-healthy, we trigger the switchover
+
+	# First we find out the IP of the master instance
+	MASTER_INST_IP=$(aws ec2 describe-instances --instance-ids $ILB_INST | jq -r '.Reservations[].Instances[].NetworkInterfaces[].PrivateIpAddresses[].PrivateIpAddress')
+
+	# We check the pgsql status on the master node
+	check_pgsql_node $MASTER_INST_IP $PGPORT 15
+	RET_CODE="$?"
+	
+	if [ "$RET_CODE" == "0" ]
+	then
+		# Every thing is fine, exit
+		log "Every thing seems to be fine on master ($ILB_INST/$MASTER_INST_IP/$PGPORT)"
+		exit 0
+	else
+		###### Cannot connect to the instance!!! #####
+		log "Connection to the master node ($ILB_INST/$MASTER_INST_IP/$PGPORT) failed. RET_CODE: $RET_CODE"
+		# Lets check the connection from the ilb to make sure
+		# that it is really down and not just a connectivity problem
+		# between two availability zones. We will also increase the timeout
+		# to rule out any slowness/load
+		ILB_DNS=$(aws elb describe-load-balancers --load-balancer-name $MY_ILB | jq -r '.LoadBalancerDescriptions[].DNSName')
+		check_pgsql_node $ILB_DNS $PGPORT 30
+		CHECK2="$?"
+		if [ "$CHECK2" == "0" ]
+		then
+			log "Connection to the ilb successfull. Dodged the bullet!"
+			exit 0
+		else
+			###### Cannot connect to the ILB !!! #####
+			###### Switchover Confirmed          #####
+			log "Cannot connect to the ILB !!! Initiating switch over"
+
+			# A random sleep between 1-30 seconds
+			# to avoid split brain
+			RAN_SLEEP=$(shuf -i 1-30 -n 1)
+			log "Sleeping for $RAN_SLEEP seconds"
+			sleep $RAN_SLEEP
+	
+			# Stop the other instance
+			log "Stopping the other instance $ILB_INST"
+			aws ec2 stop-instances --instance-ids $ILB_INST &>> $LOGFILE
+
+			# Trigger pgsql switch-over
+			log "Triggering pgsql trigger file $PGTRIGGER"
+			touch $PGTRIGGER
+
+			# Remove the other instance from its ILB
+			log "Removing instance $ILB_INST from ilb: $MY_ILB"
+			aws elb deregister-instances-from-load-balancer --load-balancer-name $MY_ILB --instances $ILB_INST &>> $LOGFILE
+		
+			# Add this instance to the ILB
+			log "Adding this instance $MY_INSTANCEID to the ilb:$MY_ILB"
+			aws elb register-instances-with-load-balancer --load-balancer-name $MY_ILB --instances $MY_INSTANCEID &>> $LOGFILE
+		fi
+	fi
+else
+	# TODO: If there is no instance in the ILB
+	# What shall we do?
+	log "Didn't find any instance in the ILB! Don't know what to do"
+	exit 1
+fi

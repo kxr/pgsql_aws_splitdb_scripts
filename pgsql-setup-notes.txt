@@ -9,7 +9,7 @@ passwd
 
 
 yum -y install epel-release
-yum -y install nc vim telnet nmap htop python-pip jq wget curl screen
+yum -y install nc vim telnet nmap htop python-pip jq wget curl screen git
 
 pip install awscli
 mkdir -p ~/.aws

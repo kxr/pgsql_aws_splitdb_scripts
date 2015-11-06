@@ -23,22 +23,17 @@ check_pgsql_node_is_master () {
 	return $?
 }
 
-# The name of the script tells it which ILB to watch
-# Which also tells us which postgresql port to watch
-# For example:
-# If we are ilb-dbam
-# We will find the port from the loadbalancer
-# Which will be 5432; So we will monitor only that
-BN=$(basename $0)
-MY_ILB=$(echo $BN | cut -d'_' -f2)
-MY_DB=$(echo $MY_ILB | cut -d'-' -f2)
+# This script is supposed to be called by the systemd daemon
+# as ExecStartPre before starting up the postgresql instance
+# We get two important environment variables set PGDATA and PGPORT
+MY_DB=$(echo $PGDATA | cut -d '/' -f4)
+MY_ILB="ilb-$MY_DB"
 if [ -z "$MY_DB" ]
 then
 	log "Cannot determine my database. Aborting."
 	exit 1
 fi
 PGTRIGGER="/opt/pgsql/$MY_DB/trigger"
-PGPORT=$(aws elb describe-load-balancers --load-balancer-names $MY_ILB | jq -r '.LoadBalancerDescriptions[].ListenerDescriptions[].Listener.InstancePort')
 
 # First we will check if this db instance
 # is already in recovery/slave mode,

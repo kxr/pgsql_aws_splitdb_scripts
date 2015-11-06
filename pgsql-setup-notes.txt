@@ -12,10 +12,10 @@ yum -y install epel-release
 yum -y install nc vim telnet nmap htop python-pip jq wget curl screen git
 
 pip install awscli
+
 mkdir -p ~/.aws
 echo '[default]
 region = us-east-1' > ~/.aws/config
-
 
 yum -y install postgresql-server
 
@@ -46,7 +46,14 @@ sed -i 's#/var/lib/pgsql#/opt/pgsql#' /etc/passwd
 sed -i 's#Environment=PGDATA=/var/lib/pgsql/data#Environment=PGDATA=/opt/pgsql/dbam/data#'  /usr/lib/systemd/system/postgresql-dbam.service
 sed -i 's#Environment=PGDATA=/var/lib/pgsql/data#Environment=PGDATA=/opt/pgsql/dbnz/data#'  /usr/lib/systemd/system/postgresql-dbnz.service
 sed -i 's#Environment=PGPORT=5432#Environment=PGPORT=5433#'  /usr/lib/systemd/system/postgresql-dbnz.service
+sed -i '/ExecStartPre=\/usr\/bin\/postgresql-check-db-dir/iExecStartPre=\/opt\/pgsql\/SetupPostgresqlRole' /usr/lib/systemd/system/postgresql-dbam.service
+sed -i '/ExecStartPre=\/usr\/bin\/postgresql-check-db-dir/iExecStartPre=\/opt\/pgsql\/SetupPostgresqlRole' /usr/lib/systemd/system/postgresql-dbnz.service
+
 systemctl daemon-reload
+
+su - postgres -c 'mkdir -p ~/.aws'
+su - postgres -c "echo '[default]
+region = us-east-1' > ~/.aws/config"
 
 
 ############################## DBAM - PG1 ###################################

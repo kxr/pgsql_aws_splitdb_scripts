@@ -36,6 +36,13 @@ echo "/dev/xvdc1      /opt/pgsql/dbnz         ext4    defaults        0 0" >> /e
 mount /opt/pgsql/dbam
 mount /opt/pgsql/dbnz
 
+
+cd /opt/pgsql
+git clone https://github.com/kxr/pgsql_aws_splitdb_scripts.git
+ln -s pgsql_aws_splitdb_scripts/SetupPostgresqlRole SetupPostgresqlRole
+ln -s pgsql_aws_splitdb_scripts/WatchDog_ilb WatchDog_ilb-dbam
+ln -s pgsql_aws_splitdb_scripts/WatchDog_ilb WatchDog_ilb-dbnz
+
 chown -R postgres:postgres /opt/pgsql
 
 mv /usr/lib/systemd/system/postgresql.service /usr/lib/systemd/system/postgresql.service.disabled
@@ -48,6 +55,32 @@ sed -i 's#Environment=PGDATA=/var/lib/pgsql/data#Environment=PGDATA=/opt/pgsql/d
 sed -i 's#Environment=PGPORT=5432#Environment=PGPORT=5433#'  /usr/lib/systemd/system/postgresql-dbnz.service
 sed -i '/ExecStartPre=\/usr\/bin\/postgresql-check-db-dir/iExecStartPre=\/opt\/pgsql\/SetupPostgresqlRole' /usr/lib/systemd/system/postgresql-dbam.service
 sed -i '/ExecStartPre=\/usr\/bin\/postgresql-check-db-dir/iExecStartPre=\/opt\/pgsql\/SetupPostgresqlRole' /usr/lib/systemd/system/postgresql-dbnz.service
+
+touch /var/log/SetupPostgresqlRole.log
+chown postgres /var/log/SetupPostgresqlRole.log
+
+
+echo '[Unit]
+Description=PostgreSQL Split-DB Monitor Scripts for EC2 Cluster
+
+[Service]
+Type=oneshot
+ExecStart=/opt/pgsql/WatchDog_ilb-dbam
+ExecStart=/opt/pgsql/WatchDog_ilb-dbnz
+' > /usr/lib/systemd/system/WatchDog_ilb.service
+
+echo '[Unit]
+Description=PostgreSQL Split-DB Monitor Timer for EC2 Cluster
+
+[Timer]
+OnBootSec=2min
+OnCalendar=*:*:0/20
+Unit=WatchDog_ilb.service
+
+[Install]
+WantedBy=multi-user.target
+' > /usr/lib/systemd/system/WatchDog_ilb.timer
+
 
 systemctl daemon-reload
 

@@ -9,6 +9,12 @@ set -u
 # in recovery/slave mode and connect it to the 
 # current/new master.
 
+# If I am not being run as postgres user, exit
+if [ "$(whoami)" != "postgres" ]
+then
+	log "Script was invoked as user: $(whoami). Should be postgres"
+	exit 1
+fi
 # A simple logging function
 LOGFILE=/var/log/$(basename $0).log
 log() {
@@ -19,7 +25,7 @@ log() {
 
 #check_pgsql_node IP/HOST PORT TIMEOUT
 check_pgsql_node_is_master () {
-	su - postgres -c "timeout $3 psql -h $1 -p $2 -U monuser -d postgres -t -c 'select pg_is_in_recovery()'" | grep -q -s -w 'f'
+	timeout $3 psql -h $1 -p $2 -U monuser -d postgres -t -c 'select pg_is_in_recovery()' | grep -q -s -w 'f'
 	return $?
 }
 
@@ -40,7 +46,7 @@ PGTRIGGER="/opt/pgsql/$MY_DB/trigger"
 # if so, we do nothing and let it startup
 if [ -e "/opt/pgsql/$MY_DB/data/recovery.conf" ]
 then
-	log "This already seems to be a slave node. Good to go."
+	log "$MY_DB: This already seems to be a slave node. Good to go."
 	exit 0
 else
 	# We are not in recovery mode, which means
@@ -60,7 +66,7 @@ else
 	then
 		# If we are in the ILB, we are the master,
 		# we do nothing and let the instance start as master
-		log "I am the master instance for $MY_ILB; Good to go."
+		log "$MY_DB: I am the master instance for $MY_ILB; Good to go."
 		exit 0
 	elif [ -n "$ILB_INST" -a "$ILB_INST" != "$MY_INSTANCEID" ]
 	then
@@ -77,23 +83,23 @@ else
 		if [ "$RET_CODE" == "0" ]
 		then
 			# Our new master seems to be good, let us connect to it as slave
-			log "New master ($ILB_INST/$MASTER_INST_IP/$PGPORT) seems to be good. Initiating slavery!"
+			log "$MY_DB: New master ($ILB_INST/$MASTER_INST_IP/$PGPORT) seems to be good. Initiating slavery!"
 
 			# Remove old data
 			# This step is dangerous
 			# If there is sufficient disk space,
 			# change this step to mv instead of rm
-			log "Removing old data: /opt/pgsql/$MY_DB/data and /opt/pgsql/$MY_DB/archive"
+			log "$MY_DB: Removing old data: /opt/pgsql/$MY_DB/data and /opt/pgsql/$MY_DB/archive"
 			rm -rf /opt/pgsql/$MY_DB/data
 			rm -rf /opt/pgsql/$MY_DB/archive
-			su - postgres -c 'mkdir -p /opt/pgsql/$MY_DB/archive/'
+			mkdir -p /opt/pgsql/$MY_DB/archive/
 
 			# Take a new pg_basebackup
-			log "Running pg_basebackup from $ILB_INST/$MASTER_INST_IP/$PGPORT"
-			su - postgres -c 'pg_basebackup -h $MASTER_INST_IP -p $PGPORT -D /opt/pgsql/$MY_DB/data -U postgres -v -P --xlog-method=stream' &>> $LOGFILE
+			log "$MY_DB: Running pg_basebackup from $ILB_INST/$MASTER_INST_IP/$PGPORT"
+			pg_basebackup -h $MASTER_INST_IP -p $PGPORT -D /opt/pgsql/$MY_DB/data -U postgres -v -P --xlog-method=stream &>> $LOGFILE
 
 			# Creating new revoery.conf
-			log "Creating new recovery.conf"
+			log "$MY_DB: Creating new recovery.conf"
 			echo "standby_mode = 'on'" > /opt/pgsql/$MY_DB/data/recovery.conf
 			echo "primary_conninfo = 'host=$MASTER_INST_IP port=$PGPORT'" >> /opt/pgsql/$MY_DB/data/recovery.conf
 			echo "trigger_file = '/opt/pgsql/$MY_DB/trigger'" >> /opt/pgsql/$MY_DB/data/recovery.conf
@@ -106,13 +112,13 @@ else
 			# Our new master seems to be unhealthy!
 			# At this point we need a manual intervention from an administrator
 			# *SEND EMAIL NOTIFICATION*
-			log "Exception, the new master who took over doesn't seem to be working. Don't know what to do. Aborting startup"
+			log "$MY_DB: Exception, the new master who took over doesn't seem to be working. Don't know what to do. Aborting startup"
 			exit 1
 		fi
 	else
 		# There is no instance in our ILB
 		# We will register our self in the ILB and startup as master
-		log "Ther was no instance in our ILB, registring, and continuing as master"
+		log "$MY_DB: There was no instance in our ILB, registring, and continuing as master"
 		aws elb register-instances-with-load-balancer --load-balancer-name $MY_ILB --instances $MY_IID | tr '\n' ' ' &>> $LOGFILE
 		exit 0
 	fi

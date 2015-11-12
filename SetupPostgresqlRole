@@ -119,7 +119,7 @@ else
 		# There is no instance in our ILB
 		# We will register our self in the ILB and startup as master
 		log "$MY_DB: There was no instance in our ILB, registring, and continuing as master"
-		aws elb register-instances-with-load-balancer --load-balancer-name $MY_ILB --instances $MY_IID | tr '\n' ' ' &>> $LOGFILE
+		aws elb register-instances-with-load-balancer --load-balancer-name $MY_ILB --instances $MY_INSTANCEID | tr '\n' ' ' &>> $LOGFILE
 		exit 0
 	fi
 fi
